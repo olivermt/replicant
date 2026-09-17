@@ -327,6 +327,11 @@ The sink must implement both `checkpoint/0` (resume) and `handle_batch/1`; it ca
 use `checkpoint_store`, and any `handle_transaction/1` implementation is ignored.
 Emits `[:replicant, :sink, :batch_committed]` telemetry once per flush.
 
+**Backpressure.** `max_inflight_lag` retains its historical name but now limits
+queued and retained payload bytes rather than WAL-position distance. Replication
+input pauses while the sink drains and resumes without disconnecting. This is a
+payload budget, not an exact process-memory limit.
+
 **Consumer-side disk spill (oversized transactions).** By default a single in-progress streamed
 transaction is bounded by the in-flight window: one larger than `max_inflight_lag` halts
 fail-closed. Opt into **disk spill** to reassemble such a transaction partly on disk and still deliver

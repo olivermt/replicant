@@ -58,8 +58,8 @@ defmodule Replicant.MixProject do
       #   - 0.22.2 floors CVE-2026-32687 (SQLi in Postgrex.Notifications.listen/3)
       #   - 0.22.3 fixes  CVE-2026-58225 (dollar-quote in Notifications reconnect replay)
       #   - 0.22.4 fixes  CVE-2026-66838 (SQLi via the :comment option in Postgrex.stream/4)
-      # No ReplicationConnection API change across 0.22.2 → 0.22.4 (security patches only).
-      {:postgrex, "~> 0.22.4"},
+      # Temporary Git pin adds ReplicationConnection pause/resume pending an upstream release.
+      {:postgrex, github: "olivermt/postgrex", ref: "77da656069235b155aea75d8bcb76a297b8ae630"},
       # Dev/Test
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

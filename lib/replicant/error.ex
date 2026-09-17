@@ -20,6 +20,7 @@ defmodule Replicant.Error do
           | :too_many_streams
           | :spill_io_failed
           | :spill_exhausted
+          | :buffer_limit_exceeded
           | :snapshot_failed
           | :snapshot_table_contended
           | :snapshot_progress_invalid

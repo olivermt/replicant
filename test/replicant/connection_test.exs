@@ -378,7 +378,7 @@ defmodule Replicant.ConnectionTest do
       begin_payload = <<"B", 0::64, 0::64, 7::32>>
       frame = <<?w, 0::64, wal_end + 10::64, 0::64, begin_payload::binary>>
       assert {:noreply, _} = Connection.handle_data(frame, advanced)
-      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _b, _f}}
+      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _b, _f, _credit}}
     end
   end
 
@@ -413,7 +413,7 @@ defmodule Replicant.ConnectionTest do
       xlog = <<?w, 0::64, 0::64, 0::64, begin_payload::binary>>
 
       assert {:noreply, _state} = Connection.handle_data(xlog, state(slot_name: "conn_xlog"))
-      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, bytes, from}}
+      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, bytes, from, _credit}}
       assert bytes == byte_size(begin_payload)
       assert from == self()
     end
@@ -446,7 +446,7 @@ defmodule Replicant.ConnectionTest do
       assert {:noreply, new_state} = Connection.handle_data(xlog, st)
       assert new_state.received_lsn == 50_000_000
       assert new_state.stream_floor_lsn == 50_000_000
-      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _bytes, _from}}
+      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _bytes, _from, _credit}}
     end
 
     test "an XLogData whose lag over the stream floor is at/under the bound still forwards" do
@@ -465,14 +465,14 @@ defmodule Replicant.ConnectionTest do
 
       assert {:noreply, new_state} = Connection.handle_data(xlog, st)
       assert new_state.received_lsn == 1100
-      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _bytes, _from}}
+      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _bytes, _from, _credit}}
     end
   end
 
   # ---- §4 bounded in-flight window / fail-closed sink-lag halt ----
 
   describe "handle_data(XLogData) — bounded in-flight window (spec §4)" do
-    test "over-bound in-flight lag halts fail-closed with :sink_too_slow and forwards nothing" do
+    test "a WAL-position gap does not halt a small payload" do
       :telemetry.attach(
         {__MODULE__, :too_slow},
         [:replicant, :connection, :disconnected],
@@ -482,7 +482,7 @@ defmodule Replicant.ConnectionTest do
 
       {:ok, _} = Registry.register(Replicant.Registry, {"conn_slow", :assembler}, nil)
       begin_payload = <<"B", 0::64, 0::64, 7::32>>
-      # floor 1000, wal_end 1201, checkpoint 0, bound 100 → lag 201 > 100 → halt.
+      # The position gap exceeds the payload budget, but contains no buffered bytes.
       xlog = <<?w, 0::64, 1201::64, 0::64, begin_payload::binary>>
 
       st =
@@ -493,14 +493,14 @@ defmodule Replicant.ConnectionTest do
           max_inflight_lag: 100
         )
 
-      assert {:disconnect, :sink_too_slow} = Connection.handle_data(xlog, st)
-
-      assert_received {:disc, %{lag: 201}, %{reason: :sink_too_slow}}
-      refute_received {:"$gen_cast", _}
+      assert {:noreply, state} = Connection.handle_data(xlog, st)
+      assert Replicant.FlowControl.queued_bytes(state.flow) == byte_size(begin_payload)
+      refute_received {:disc, _, _}
+      assert_received {:"$gen_cast", {:message, %Begin{}, _, _, _}}
       :telemetry.detach({__MODULE__, :too_slow})
     end
 
-    test "lag is measured against the durable checkpoint once it advances past the floor" do
+    test "a durable checkpoint does not turn WAL-position lag into buffered bytes" do
       :telemetry.attach(
         {__MODULE__, :cp_floor},
         [:replicant, :connection, :disconnected],
@@ -510,8 +510,7 @@ defmodule Replicant.ConnectionTest do
 
       {:ok, _} = Registry.register(Replicant.Registry, {"conn_cpfloor", :assembler}, nil)
       begin_payload = <<"B", 0::64, 0::64, 7::32>>
-      # checkpoint has advanced to 5000 (a real commit LSN) above the 1000 floor;
-      # wal_end 5150 → lag = 5150 - max(5000, 1000) = 150 > 100 → halt.
+      # Checkpoint and WAL-frontier bookkeeping must remain independent of credits.
       xlog = <<?w, 0::64, 5150::64, 0::64, begin_payload::binary>>
 
       st =
@@ -522,8 +521,10 @@ defmodule Replicant.ConnectionTest do
           max_inflight_lag: 100
         )
 
-      assert {:disconnect, :sink_too_slow} = Connection.handle_data(xlog, st)
-      assert_received {:disc, %{lag: 150}, %{reason: :sink_too_slow}}
+      assert {:noreply, state} = Connection.handle_data(xlog, st)
+      assert state.checkpoint_lsn == 5000
+      assert Replicant.FlowControl.queued_bytes(state.flow) == byte_size(begin_payload)
+      refute_received {:disc, _, _}
       :telemetry.detach({__MODULE__, :cp_floor})
     end
 
@@ -1693,14 +1694,11 @@ defmodule Replicant.ConnectionTest do
       refute_received :checkpoint_read
     end
 
-    test "a reconnect resets the spilled_bytes mirror to 0 (never carries a stale-high value)" do
-      # init/1 runs ONCE; RECONNECTS re-enter through handle_connect/1. The assembler zeroes its
-      # spilled_total on reconnect (reset_streams), but the {:spilled_bytes,_} signal only fires on
-      # a CHANGE during message observation — never on reset. So handle_connect MUST re-zero the
-      # Connection's mirror, or a stale-high spilled_bytes over-subtracts the §4 numerator and a
-      # slow-sink reconnect that does not re-spill evades the RAM-bound halt indefinitely.
+    test "recovery starts a fresh processing-credit generation" do
+      flow = Replicant.FlowControl.push(Replicant.FlowControl.new(), 4242)
+
       {:query, _sql, identity_state} =
-        Connection.handle_connect(state(spilled_bytes: 4242, step: :disconnected))
+        Connection.handle_connect(state(flow: flow, step: :disconnected))
 
       identity_result = [
         %Postgrex.Result{rows: [["7436598280501831754", "7", "0/16B6C50", "source_db"]]}
@@ -1708,7 +1706,8 @@ defmodule Replicant.ConnectionTest do
 
       {:query, _sql, new_state} = Connection.handle_result(identity_result, identity_state)
 
-      assert new_state.spilled_bytes == 0
+      assert Replicant.FlowControl.queued_bytes(new_state.flow) == 0
+      refute new_state.flow.epoch == flow.epoch
     end
 
     test "recovery_check emits [:connection, :connected] with the source kind" do
@@ -1872,12 +1871,12 @@ defmodule Replicant.ConnectionTest do
       assert {:noreply, s1} =
                Replicant.Connection.handle_data(start_frame, st_state("conn_st", :streaming))
 
-      assert_receive {:"$gen_cast", {:message, %StreamStart{xid: 100}, _, _}}
+      assert_receive {:"$gen_cast", {:message, %StreamStart{xid: 100}, _, _, _}}
       assert s1.in_stream == true
 
       stop_frame = <<?w, 0::64, 11::64, 0::64, "E">>
       assert {:noreply, s2} = Replicant.Connection.handle_data(stop_frame, s1)
-      assert_receive {:"$gen_cast", {:message, %StreamStop{}, _, _}}
+      assert_receive {:"$gen_cast", {:message, %StreamStop{}, _, _, _}}
       assert s2.in_stream == false
     end
 
@@ -1910,7 +1909,7 @@ defmodule Replicant.ConnectionTest do
     end
   end
 
-  describe "spill in-flight-lag accounting (spec §4/§9)" do
+  describe "payload accounting with streaming enabled" do
     defp sp_state(slot, extra \\ %{}) do
       Map.merge(
         %Replicant.Connection{
@@ -1925,8 +1924,6 @@ defmodule Replicant.ConnectionTest do
           received_lsn: 0,
           stream_floor_lsn: 0,
           in_stream: false,
-          spilled_bytes: 0,
-          max_spill_bytes: 500,
           max_inflight_lag: 100,
           step: :streaming
         },
@@ -1934,37 +1931,31 @@ defmodule Replicant.ConnectionTest do
       )
     end
 
-    test "the halt ceiling is max_inflight_lag + max_spill_bytes (RAM + disk)" do
-      # received-floor 620, spilled 0 → resident lag 620 > 100 + 500 = 600 → halt
-      s = %{sp_state("c2") | received_lsn: 620, spilled_bytes: 0}
+    test "disk budget does not turn an LSN gap into queued work" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"c2", :assembler}, nil)
+      s = %{sp_state("c2") | received_lsn: 620}
       frame = <<?w, 0::64, 620::64, 0::64, "E">>
-      assert {:disconnect, :sink_too_slow} = Replicant.Connection.handle_data(frame, s)
+      assert {:noreply, state} = Replicant.Connection.handle_data(frame, s)
+      assert Replicant.FlowControl.queued_bytes(state.flow) == 1
     end
 
-    test "spilled bytes lower the numerator so the SAME frame that halts at spilled=0 forwards when spilled is high" do
-      # WITHOUT the -spilled subtraction, received-floor 620 halts; WITH spilled=550,
-      # 620-550=70 < 600 → no halt (forwards)
+    test "spill accounting cannot release assembler mailbox credits" do
       {:ok, _} = Registry.register(Replicant.Registry, {"c2b", :assembler}, nil)
-      s = %{sp_state("c2b") | received_lsn: 620, spilled_bytes: 550}
+      s = %{sp_state("c2b") | received_lsn: 620}
       frame = <<?w, 0::64, 620::64, 0::64, "E">>
-      refute match?({:disconnect, :sink_too_slow}, Replicant.Connection.handle_data(frame, s))
+      assert {:noreply, state} = Replicant.Connection.handle_data(frame, s)
+      assert Replicant.FlowControl.queued_bytes(state.flow) == 1
+      assert {:noreply, ^state} = Replicant.Connection.handle_info({:spilled_bytes, 550}, state)
     end
 
-    test "a {:spilled_bytes, total} message updates the connection's spilled counter (handled, not swallowed by the catch-all)" do
-      s = sp_state("c3")
-      assert {:noreply, s2} = Replicant.Connection.handle_info({:spilled_bytes, 400}, s)
-      assert s2.spilled_bytes == 400
-    end
-
-    test "a NON-spill connection (max_spill_bytes: nil) halts at EXACTLY max_inflight_lag (ceiling unchanged)" do
-      # No spill config → max_spill_bytes nil → effective_lag_bound returns the base
-      # max_inflight_lag verbatim (byte-identical to the pre-task §4 halt for existing users).
+    test "a NON-spill connection also accounts payload bytes instead of LSN distance" do
       {:ok, _} = Registry.register(Replicant.Registry, {"c4", :assembler}, nil)
 
-      # floor 500, bound 100 → wal_end 601 gives lag 101 > 100 → halt.
+      # A one-byte control payload is one queued byte on either side of the old LSN limit.
       halt_state = state(slot_name: "c4", stream_floor_lsn: 500, max_inflight_lag: 100)
       halt_frame = <<?w, 0::64, 601::64, 0::64, "E">>
-      assert {:disconnect, :sink_too_slow} = Connection.handle_data(halt_frame, halt_state)
+      assert {:noreply, state} = Connection.handle_data(halt_frame, halt_state)
+      assert Replicant.FlowControl.queued_bytes(state.flow) == 1
 
       # wal_end 600 gives lag 100 == bound (not OVER) → forwards.
       fwd_state = state(slot_name: "c4", stream_floor_lsn: 500, max_inflight_lag: 100)
